@@ -1,0 +1,440 @@
+---
+title: "Analysis of US ETFs"
+author: "Nabil Jabareen"
+date: "31 März 2018"
+output: 
+  html_document: 
+    code_folding: hide
+---
+
+```{r warning=FALSE, include=FALSE}
+setwd("/Users/Anja/Desktop/Kaggle_StockMarket/")
+#install_github("walkerke/bsselectR")
+
+library(data.table)
+library(ggplot2)
+library(magrittr) #imports "%>%" option
+library(gridExtra) #multi grid s for ggplots
+library(plotly) #interactie plot
+library(psych) #correlation/pairs plot
+library(corrplot) #correlation plot
+```
+
+#The Data  
+Given are 1344 ETFs from the US. As shown below, the data consists of the Variables Date, Open, High, Low, Close, Volume and OpenInt. The Variable *Price* has been added for every Date by taking the mean of the *High* and *Low* for every date.
+
+```{r Read ETFs, cache=TRUE, echo=FALSE}
+#Read ETF files in a list of data.tables
+etfs.files <- list.files("ETFs", pattern = "*.txt")
+
+etfs <- lapply(etfs.files,
+               function(x) fread(paste("ETFs" ,x, sep = "/"), header = T, sep = ","))
+
+names(etfs) <- gsub(".txt", "", etfs.files)
+
+
+#Convert dates to date Formats
+etfs <- lapply(etfs, function(x) {
+  x$Date <- as.Date(x$Date)
+  x
+})
+
+#Calculate mean for every date
+etfs <- lapply(etfs, function(x) {
+  x[, Price := apply(x, 1, function(y) mean(as.numeric(c(y["High"], y["Low"])) ))]
+  })
+
+#Structure of ETF data
+head(etfs[[1]])
+
+#Get data.table with date and Price only
+etfs.red <- lapply(etfs, function(x) x[,c("Date", "Price")])
+```
+
+```{r overall return}
+
+overall_return <- function(x){
+  o.return <- (x[which.max(Date)]$Price - x[which.min(Date)]$Price)/x[which.min(Date)]$Price
+  o.return
+  }
+
+overall_returns <- sapply(etfs.red, function(x) overall_return(x))
+```
+
+With the price given for each ETF, I calculated the [fractal dimension](https://en.wikipedia.org/wiki/Fractal_dimension) first introduced by Benoit Mandelbrot. The fractal dimension can be thought of as a measure of roughness for a given geometric object (including curves). To calculate the fractal dimension for finencial price charts various methods have been suggested. Some of them can get quite complicated. I choosed a rather simple one by John Ehlers ( [Original publication](http://www.stockspotter.com/Files/frama.pdf)). The Formula to calculate the fractal dimension $D$ is as follows:
+
+$$\begin{aligned}
+D &= \frac{Log(HL1 + HL2) - Log(HL)}{Log(2)} \\
+HL1 &= \frac{Max(High, \frac{1}{2}N..N)-Min(Low,\frac{1}{2}N..N)}{\frac{1}{2}N} \\
+HL2 &= \frac{Max(High, \frac{1}{2}N)-Min(Low,\frac{1}{2}N)}{\frac{1}{2}N} \\
+HL &= \frac{(Max(High,N) - Min(Low,N))}{N}
+\end{aligned}$$
+
+I applied this formula on all ETFs with 1000 or more data points. 
+
+```{r Fractal Dimensions, warning=FALSE, cache=TRUE}
+#Remove etfs with very low data
+etf.length <- sapply(etfs.red, function(x) nrow(x))
+etfs.red <- etfs.red[etf.length > 999]
+
+#Function to calculate fractal dimension as intruduced by John Ehlers
+fractal_dimension <- function(data){
+  
+  data.half <- nrow(data)/2
+  first.half <- 1:round(data.half)
+  data1 <- data[first.half]
+  data2 <- data[!first.half]
+  
+  hl1 <- (max(data1$Price) - min(data1$Price)) / data.half
+  hl2 <- (max(data2$Price) - min(data2$Price)) / data.half
+  hl <- (max(data$Price) - min(data$Price)) / nrow(data)
+  
+  D <- (log(hl1 + hl2) - log(hl)) / log(2)
+  D
+}
+
+#Get for all ETFs the fractal dimension 'D'
+fractal_dimensions <- sapply(etfs.red, function(x) fractal_dimension(x))
+
+#First look at fractal dimensions
+  #table(round(fractal_dimensions, 1))
+```
+
+The fractal dimension can be thought of a measure of volatility for a finencial price chart. A more common measure of volatility is the *Historic Volatility*. 
+Historic Volatility ($=HV$) has been calculated as:
+$$\begin{aligned}
+HV &= sd(R) \\
+R &= ln(\frac{V_f}{V_i})
+\end{aligned}$$
+
+$R =$ logarithmic return  
+$V_i =$ price when market closed on day i  
+$V_f =$ price when market closed of the next day  
+
+
+```{r Historic Volatility}
+#Logarithmic or continuously compounded return
+get_log_return <- function(x){
+  nextP <- c(0, x$Price[1:length(x$Price)-1])
+  x[, log_return := log(nextP/Price)]
+}
+
+get_abs_return <- function(x){
+  nextP <- c(0, x$Price[1:length(x$Price)-1])
+  x[, abs_return := nextP-Price]
+}
+
+etfs.red <- lapply(etfs.red, get_log_return)
+etfs.red <- lapply(etfs.red, get_abs_return)
+
+#Historic Volatility
+hist_vol <- sapply(etfs.red, function(x) sd(x$log_return[-1]))
+```
+
+```{r Read in S & P 500}
+sp500 <- fread("sp500.csv", sep = ",")
+sp500[, Price := apply(sp500, 1, function(x) mean(as.numeric(c(x["High"], x["Low"]))))]
+sp500 <- sp500[, c("Date", "Price")]
+sp500$Date <- as.Date(sp500$Date)
+
+get_log_return(sp500)
+sp500$log_return[1] <- 0
+```
+
+```{r Get betas}
+sp500.var <- var(sp500$log_return[-1])
+
+get_beta <- function(x, sp500.var){
+  x$log_return[1] <- 0
+  #Merge to get overlaping Dates
+  a <- merge(x, sp500, by = "Date")
+  x.cov <- cov(a$log_return.x, a$log_return.y)
+  beta <- x.cov/sp500.var
+  beta
+}
+
+betas <- sapply(etfs.red, function(x) get_beta(x, sp500.var))
+```
+
+
+```{r sharpe ratio}
+
+#Calculating sharpe ration S = mean(daily_return - daily_rf) / std(daily_return) 
+#daily_rf = 0%
+
+calc_sharpe_ratio <- function(x, abs = FALSE){
+  if(abs == FALSE){
+ sharpe <- mean(x$log_return[-1])/sd(x$log_return[-1])
+ sharpe
+} else {
+    sharpe <- mean(x$abs_return[-1])/sd(x$abs_return[-1])
+    sharpe
+  }
+}
+
+sharpe_ratios <- sapply(etfs.red, function(x) calc_sharpe_ratio(x))
+sharpe_ratios_abs <- sapply(etfs.red, function(x) calc_sharpe_ratio(x, abs = TRUE))
+
+```
+
+```{r Volatility measures Histogram, warning=FALSE}
+volatility_measures <- data.table(etf = names(etfs.red), hist_vol, fractal_dimensions, betas, sharpe_ratios_abs, overall_returns)
+
+volatility_measures_hist <- melt(volatility_measures[, -c("etf", "overall_returns")], variable.name = "measure")
+levels(volatility_measures_hist$measure) <- c("Historic Volatilitys", "Fractal Dimensions", "Betas", "Sharpe Ratios")
+ggplot(volatility_measures_hist, aes(value)) + 
+  geom_histogram(bins = 20, col = "black", fill = "lightgrey") + 
+  facet_wrap(~measure, scales = "free") +
+  labs(title = "Distrubution of volatility measurments") + 
+  theme_minimal()
+```
+
+
+In the following plot I compare the ETFs with the lowest and highest fractal dimensions. Additionally to the Price chart I plotted the daily price fluctuation. This is simply the change of the Price from one day to the next. Note that the scales for the price charts are different!
+
+```{r calc price change}
+#Highest vs lowest fractal dimension
+highest.dimension <- fractal_dimensions[which.max(fractal_dimensions)]
+lowest.dimension <- fractal_dimensions[which.min(fractal_dimensions)]
+
+highest.dimension.chart <- etfs.red[[attributes(highest.dimension)$names]]
+lowest.dimension.chart <- etfs.red[[attributes(lowest.dimension)$names]]
+
+price_fluc <- function(price.chart){
+  next.price <- c(NA, price.chart[1:nrow(price.chart)-1]$Price)
+  price.chart[, price_change := Price - next.price]
+}
+
+price_fluc(lowest.dimension.chart)
+price_fluc(highest.dimension.chart)
+
+```
+
+```{r lowest D, warning=FALSE}
+p <- lowest.dimension.chart %>% 
+  plot_ly(x = ~Date, y = ~Price) %>% add_lines()
+
+p1 <- lowest.dimension.chart %>% 
+  plot_ly(x = ~Date, y = ~price_change, type = "bar") %>%
+  layout(yaxis = list(title = "Price Change"))
+
+subplot(p, p1, nrows = 2, shareX = T, titleY = T) %>% 
+  layout(title=  paste("Price chart of rwk.us (D = ", round(lowest.dimension, 3),")", sep = ""), showlegend = F)
+```
+
+```{r highest D, warning=FALSE}
+p <- highest.dimension.chart %>% 
+  plot_ly(x = ~Date, y = ~Price) %>% add_lines()
+
+p1 <- highest.dimension.chart %>% 
+  plot_ly(x = ~Date, y = ~price_change, type = "bar") %>%
+  layout(yaxis = list(title = "Price Change"))
+
+subplot(p, p1, nrows = 2, shareX = T, titleY = T) %>% 
+  layout(title= paste("Price chart of emlp.us (D = ", round(highest.dimension, 3), ")", sep = ""), showlegend = F)
+```
+
+
+```{r HV}
+highest.hv.chart <- etfs.red[[which.max(hist_vol)]]
+lowest.hv.chart <- etfs.red[[which.min(hist_vol)]]
+
+highest_hv <- hist_vol[which.max(hist_vol)]
+lowest_hv <- variabl[which.min(hist_vol)]
+
+price_fluc(highest.hv.chart)
+price_fluc(lowest.hv.chart)
+```
+
+
+```{r highest HV, warning=FALSE}
+p <- highest.hv.chart %>% 
+  plot_ly(x = ~Date, y = ~Price) %>% add_lines()
+
+p1 <- highest.hv.chart %>% 
+  plot_ly(x = ~Date, y = ~price_change, type = "bar") %>%
+  layout(yaxis = list(title = "Price Change"))
+
+subplot(p, p1, nrows = 2, shareX = T, titleY = T) %>% 
+  layout(title=paste("Price chart of ", names(highest_hv) ," (HV = ", round(highest_hv, 4), ")", sep = ""), showlegend = F)
+```
+
+```{r lowest HV, warning=FALSE}
+p <- lowest.hv.chart %>% 
+  plot_ly(x = ~Date, y = ~Price) %>% add_lines()
+
+p1 <- lowest.hv.chart %>% 
+  plot_ly(x = ~Date, y = ~price_change, type = "bar") %>%
+  layout(yaxis = list(title = "Price Change"))
+
+subplot(p, p1, nrows = 2, shareX = T, titleY = T) %>% 
+  layout(title=paste("Price chart of ", names(lowest_hv) ," (HV = ", round(lowest_hv, 4), ")", sep = ""), showlegend = F)
+```
+
+```{r price chart plot}
+plot_price_chart <- function(etfs, variable, max = TRUE){
+  require(magrittr)
+  require(plotly)
+  require(data.table)
+  
+  if(max == TRUE){
+  
+    max.chart <- etfs[[which.max(variable)]]
+    max_var <- variable[which.max(variable)]
+    max.chart <- price_fluc(max.chart)
+    
+    p <- max.chart %>% plot_ly(x = ~Date, y = ~Price) %>% add_lines()
+
+    p1 <- max.chart %>% 
+      plot_ly(x = ~Date, y = ~price_change, type = "bar") %>%
+      layout(yaxis = list(title = "Price Change"))
+
+    subplot(p, p1, nrows = 2, shareX = T, titleY = T) %>% 
+      layout(title=paste("Price chart of ", names(max_var) ," (HV = ", round(max_var, 4), ")", sep = ""), showlegend = F)
+
+  } else {
+    
+    min.chart <- etfs[[which.min(variable)]]
+    min_var <- variable[which.min(variable)]
+    min.chart <- price_fluc(min.chart)
+    
+    p <- min.chart %>% plot_ly(x = ~Date, y = ~Price) %>% add_lines()
+
+    p1 <- min.chart %>% 
+      plot_ly(x = ~Date, y = ~price_change, type = "bar") %>%
+      layout(yaxis = list(title = "Price Change"))
+
+    subplot(p, p1, nrows = 2, shareX = T, titleY = T) %>% 
+      layout(title=paste("Price chart of ", names(min_var) ," (HV = ", round(min_var, 4), ")", sep = ""), showlegend = F)
+    
+  }
+  
+
+}
+  
+plot_price_chart(etfs.red, hist_vol, max = T)
+plot_price_chart(etfs.red, hist_vol, max = F)
+plot_price_chart(etfs.red, fractal_dimensions, max = T)
+plot_price_chart(etfs.red, fractal_dimensions, max = F)
+plot_price_chart(etfs.red, betas, max = T)
+plot_price_chart(etfs.red, betas, max = F)
+plot_price_chart(etfs.red, sharpe_ratios_abs, max = T)
+plot_price_chart(etfs.red, sharpe_ratios_abs, max = F)
+
+```
+
+
+
+```{r}
+
+pairs.panels(volatility_measures[, -c("etf")])
+
+#lapply(a$etf, function(x) plot( etfs.red[[ x ]]$Price , type = "l"))
+```
+
+
+```{r}
+
+g_legend <- function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+legend <- ggplot(volatility_measures, 
+       aes(hist_vol, betas, color = overall_returns)) + 
+  geom_point() +
+  scale_color_continuous(low = "lightgrey", high = "black")
+
+
+legend <- g_legend(legend)
+
+p1 <- ggplot(volatility_measures, 
+       aes(hist_vol, betas, size = overall_returns, color = overall_returns)) + 
+  geom_point(aes(alpha = 0.3), show.legend = F) +
+  scale_color_continuous(low = "lightgrey", high = "black") + 
+  theme_minimal()
+
+
+p2 <- ggplot(volatility_measures,
+        aes(hist_vol, sharpe_ratios_abs, size = overall_returns, color = overall_returns)) +
+  geom_point(aes(alpha = 0.3), show.legend = F) +
+  scale_color_continuous(low = "lightgrey", high = "black") + 
+  theme_minimal()
+
+p3 <- ggplot(volatility_measures,
+       aes(hist_vol, fractal_dimensions, size = overall_returns, color = overall_returns)) +
+  geom_point(aes(alpha = 0.3), show.legend = F) +
+  scale_color_continuous(low = "lightgrey", high = "black") + 
+  theme_minimal()
+
+
+p4 <- ggplot(volatility_measures,
+       aes(betas, sharpe_ratios_abs, size = overall_returns, color = overall_returns)) +
+  geom_point(aes(alpha = 0.3), show.legend = F) +
+  scale_color_continuous(low = "lightgrey", high = "black") + 
+  theme_minimal()
+
+p5 <- ggplot(volatility_measures,
+       aes(betas, fractal_dimensions, size = overall_returns, color = overall_returns)) +
+  geom_point(aes(alpha = 0.3), show.legend = F) +
+  scale_color_continuous(low = "lightgrey", high = "black") + 
+  theme_minimal()
+
+p6 <- ggplot(volatility_measures,
+       aes(sharpe_ratios_abs, fractal_dimensions, size = overall_returns, color = overall_returns)) +
+  geom_point(aes(alpha = 0.3), show.legend = F) +
+  scale_color_continuous(low = "lightgrey", high = "black") +
+  theme_minimal()
+
+layout <- rbind(c(1,NA,7),c(2,4,NA),c(3,5,6))
+
+grid.arrange(p1, p2, p3, p4, p5, p6, legend, layout_matrix = layout)
+
+
+
+```
+
+```{r, include=FALSE}
+
+merged_dt <- etfs.red[[1]]
+merged_dt <- merged_dt[, c("Date", "Price")]
+
+first.name <- names(etfs.red[1])
+colnames(merged_dt) <- c("Date", first.name)
+
+
+#Tales Long. only one date in common for all etfs with > 1000 obs
+for(etf in 1:length(etfs.red)){
+  x <- etfs.red[[etf]]
+  x <- x[, c("Date", "Price")]
+  x.name <- names(etfs.red[etf])
+  colnames(x) <- c("Date", x.name)
+  merged_dt <- merge(merged_dt, x, by = "Date")  
+}
+
+
+top_D <- sort(fractal_dimensions)[1:10]
+top_D_dt <- etfs.red[[names(top_D[1])]]
+top_D_dt <- top_D_dt[, c("Date", "Price")]
+
+first.name <- names(top_D[1])
+colnames(top_D_dt) <- c("Date", first.name)
+
+for(etf in 2:length(top_D)){
+  x <- etfs.red[[names(top_D[etf])]]
+  x <- x[, c("Date", "Price")]
+  x.name <- names(top_D[etf])
+  colnames(x) <- c("Date", x.name)
+  top_D_dt <- merge(top_D_dt, x, by = "Date")
+}
+
+
+top_D_mat <- as.matrix(top_D_dt[, -c("Date")])
+
+top_D_cor <- cor(top_D_mat)
+
+corrplot(top_D_cor)
+
+```
+
